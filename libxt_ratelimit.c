@@ -63,6 +63,10 @@ static int parse_mode(uint32_t *mode, const char *option_arg)
 		*mode |= XT_RATELIMIT_DST;
 	else if (strcasecmp("src", option_arg) == 0)
 		*mode |= XT_RATELIMIT_SRC;
+	else if (strcasecmp("pps-dst", option_arg) == 0)
+		*mode |= XT_RATELIMIT_DST | XT_RATELIMIT_PPS;
+	else if (strcasecmp("pps-src", option_arg) == 0)
+		*mode |= XT_RATELIMIT_SRC| XT_RATELIMIT_PPS;
 	else
 		return -1;
 	return 0;
@@ -70,6 +74,8 @@ static int parse_mode(uint32_t *mode, const char *option_arg)
 
 static void print_mode(unsigned int mode)
 {
+	if (mode & XT_RATELIMIT_PPS)
+		fputs("pps-", stdout);
 	/* DST is primary and exclusive with SRC*/
 	if (mode & XT_RATELIMIT_DST)
 		fputs("dst", stdout);

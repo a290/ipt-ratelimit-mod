@@ -133,6 +133,7 @@ struct xt_ratelimit_htable {
 	unsigned int mt_count;		/* currently matches in the hash */
 	unsigned int ent_count;		/* currently entities linked */
 	unsigned int size;		/* hash array size */
+	__u32 mode;
 	int other;			/* what to do with 'other' packets */
 	struct net *net;		/* for destruction */
 	struct proc_dir_entry *pde;
@@ -179,7 +180,7 @@ unsigned long calc_rate_est(const struct ratelimit_stat *stat)
 #define SAFEDIV(x,y) ((y)? ({ u64 __tmp = x; do_div(__tmp, y); (unsigned int)__tmp; }) : 0)
 
 static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
-    struct seq_file *s)
+    struct seq_file *s, __u32 mode)
 {
 	struct ratelimit_ent *ent = mt->ent;
 	int i;
@@ -196,9 +197,13 @@ static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
 		    i == 0? "" : ",",
 		    &ent->matches[i].addr);
 	}
-	seq_printf(s, " cir %u cbs %u ebs %u;",
-	    ent->car.cir * (HZ * BITS_PER_BYTE), ent->car.cbs, ent->car.ebs);
-
+	if (mode & XT_RATELIMIT_PPS) {
+		seq_printf(s, " cir %u cbs %u ebs %u;",
+				   ent->car.cir, ent->car.cbs / HZ, ent->car.ebs / HZ);
+	} else {
+		seq_printf(s, " cir %u cbs %u ebs %u;",
+				   ent->car.cir * (HZ * BITS_PER_BYTE), ent->car.cbs, ent->car.ebs);
+	}
 	seq_printf(s, " tc %u te %u last", ent->car.tc, ent->car.te);
 	if (ent->car.last)
 		seq_printf(s, " %ld;", jiffies - ent->car.last);
@@ -235,7 +240,7 @@ static int ratelimit_seq_show(struct seq_file *s, void *v)
 	/* print everything from the bucket at once */
 	if (!hlist_empty(&ht->hash[*bucket])) {
 		compat_hlist_for_each_entry(mt, pos, &ht->hash[*bucket], node)
-			if (ratelimit_seq_ent_show(mt, s))
+			if (ratelimit_seq_ent_show(mt, s, ht->mode))
 				return -1;
 	}
 	return 0;
@@ -442,17 +447,22 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 		}
 		val = simple_strtoul(v, NULL, 10);
 		switch (i) {
-			case 0:
-				ent->car.cir = val / (HZ * BITS_PER_BYTE);
-				/* autoconfigure optimal parameters */
-				val = val / 8 + (val / 8 / 2);
+            case 0:
+				if (!(ht->mode & XT_RATELIMIT_PPS)) {
+					ent->car.cir = val / (HZ * BITS_PER_BYTE);
+					/* autoconfigure optimal parameters */
+					val = val / 8 + (val / 8 / 2);
+				}
+				else {
+					ent->car.cir = val;
+				}
 				/* FALLTHROUGH */
 			case 1:
-				ent->car.cbs = val;
-				val *= 2;
+				ent->car.cbs = (ht->mode & XT_RATELIMIT_PPS) ? val * HZ : val;
+				val *= (ht->mode & XT_RATELIMIT_PPS) ? 0 : 2;
 				/* FALLTHROUGH */
 			case 2:
-				ent->car.ebs = val;
+				ent->car.ebs = (ht->mode & XT_RATELIMIT_PPS) ? val * HZ : val;
 		}
 	}
 	if (add && str == p) {
@@ -615,6 +625,7 @@ static int htable_create(struct net *net, struct xt_ratelimit_mtinfo *minfo)
 		return -ENOMEM;
 	}
 	ht->net = net;
+	ht->mode = minfo->mode;
 
 	hlist_add_head(&ht->node, &ratelimit_net->htables);
 
@@ -785,6 +796,10 @@ static int htable_get(struct net *net,
 
 	compat_hlist_for_each_entry(ht, pos, &ratelimit_net->htables, node) {
 		if (!strcmp(minfo->name, ht->name)) {
+			if ((ht->mode & XT_RATELIMIT_PPS) != (minfo->mode & XT_RATELIMIT_PPS)) {
+				pr_err("Same ratelimit-set cannot be used in different ratelimit modes simultaneously: %s\n", ht->name);
+				return -EINVAL;
+			}
 			ht->use++;
 			minfo->ht = ht;
 			return 0;
@@ -842,11 +857,12 @@ ratelimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	if (ent) {
 		struct ratelimit_car *car = &ent->car;
 		const unsigned int len = skb->len; /* L3 */
+		const unsigned int tsz = (mtinfo->mode & XT_RATELIMIT_PPS) ? HZ : len;
 		u32 tok;
 
 		spin_lock(&ent->lock_bh);
 		tok = (now - car->last) * car->cir;
-		car->tc += len;
+		car->tc += tsz;
 		if (tok) {
 			car->tc -= min(tok, car->tc);
 			car->last = now;
@@ -855,7 +871,7 @@ ratelimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 			car->te += car->tc - car->cbs;
 			if (car->te > car->ebs) {
 				car->te = 0;
-				car->tc -= len;
+				car->tc -= tsz;
 				match = true; /* match is drop */
 			}
 		}
