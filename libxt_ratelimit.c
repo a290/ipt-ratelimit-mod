@@ -134,7 +134,7 @@ static struct xtables_match ratelimit_mt_reg[] = {
 	{
 		.name		= "ratelimit",
 		.version	= XTABLES_VERSION,
-		.family		= NFPROTO_IPV4,
+        .family		= NFPROTO_UNSPEC,
 		.size		= XT_ALIGN(sizeof(struct xt_ratelimit_mtinfo)),
 		.userspacesize	= offsetof(struct xt_ratelimit_mtinfo, ht),
 		.help		= ratelimit_help,
@@ -143,7 +143,7 @@ static struct xtables_match ratelimit_mt_reg[] = {
 		.save		= ratelimit_save,
 		.x6_options	= ratelimit_opts,
 		.x6_parse	= ratelimit_parse,
-	},
+    },
 };
 
 void _init(void)

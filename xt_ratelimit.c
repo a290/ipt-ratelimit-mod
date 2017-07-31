@@ -55,6 +55,7 @@ MODULE_DESCRIPTION("iptables ratelimit policer mt module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(XT_RATELIMIT_VERSION);
 MODULE_ALIAS("ipt_ratelimit");
+MODULE_ALIAS("ip6t_ratelimit");
 
 #define RATE_ESTIMATOR			/* average rate estimator */
 
@@ -73,8 +74,8 @@ static DEFINE_MUTEX(ratelimit_mutex); /* htable lists management */
 
 /* net namespace support */
 struct ratelimit_net {
-        struct hlist_head	htables;
-        struct proc_dir_entry	*ipt_ratelimit;
+		struct hlist_head	htables;
+		struct proc_dir_entry	*ipt_ratelimit;
 };
 
 /* CAR accounting */
@@ -106,7 +107,7 @@ struct ratelimit_stat {
 /* hash bucket entity */
 struct ratelimit_match {
 	struct hlist_node node;		/* hash bucket list */
-	__be32 addr;
+	int ifindex;
 	struct ratelimit_ent *ent;	/* owner */
 };
 
@@ -145,7 +146,7 @@ static int ratelimit_net_id;
 /* return pointer to per-net-namespace struct */
 static inline struct ratelimit_net *ratelimit_pernet(struct net *net)
 {
-        return net_generic(net, ratelimit_net_id);
+		return net_generic(net, ratelimit_net_id);
 }
 
 #ifdef RATE_ESTIMATOR
@@ -180,7 +181,7 @@ unsigned long calc_rate_est(const struct ratelimit_stat *stat)
 #define SAFEDIV(x,y) ((y)? ({ u64 __tmp = x; do_div(__tmp, y); (unsigned int)__tmp; }) : 0)
 
 static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
-    struct seq_file *s, __u32 mode)
+	struct seq_file *s, __u32 mode)
 {
 	struct ratelimit_ent *ent = mt->ent;
 	int i;
@@ -193,9 +194,9 @@ static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
 	/* lock for consistent reads from the counters */
 	spin_lock_bh(&ent->lock_bh);
 	for (i = 0; i < ent->mtcnt; i++) {
-		seq_printf(s, "%s%pI4",
-		    i == 0? "" : ",",
-		    &ent->matches[i].addr);
+		seq_printf(s, "%s%i",
+			i == 0? "" : ",",
+			ent->matches[i].ifindex);
 	}
 	if (mode & XT_RATELIMIT_PPS) {
 		seq_printf(s, " cir %u cbs %u ebs %u;",
@@ -211,7 +212,7 @@ static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
 		seq_printf(s, " never;");
 
 	seq_printf(s, " conf %u/%llu",
-	    (u32)atomic_read(&ent->stat.green_pkt),
+		(u32)atomic_read(&ent->stat.green_pkt),
 		 (u64)atomic64_read(&ent->stat.green_bytes));
 
 #ifdef RATE_ESTIMATOR
@@ -219,7 +220,7 @@ static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
 #endif
 
 	seq_printf(s, ", rej %u/%llu",
-	    (u32)atomic_read(&ent->stat.red_pkt),
+		(u32)atomic_read(&ent->stat.red_pkt),
 		 (u64)atomic64_read(&ent->stat.red_bytes));
 
 	seq_printf(s, "\n");
@@ -308,22 +309,20 @@ static int ratelimit_proc_open(struct inode *inode, struct file *file)
 
 static void ratelimit_table_flush(struct xt_ratelimit_htable *ht);
 static struct ratelimit_ent *ratelimit_ent_zalloc(int msize);
-static inline struct ratelimit_ent *ratelimit_match_find(const struct xt_ratelimit_htable *ht, const __be32 addr);
+static inline struct ratelimit_ent *ratelimit_match_find(const struct xt_ratelimit_htable *ht, const int ifindex);
 static void ratelimit_ent_add(struct xt_ratelimit_htable *ht, struct ratelimit_ent *ent);
 static void ratelimit_ent_del(struct xt_ratelimit_htable *ht, struct ratelimit_ent *ent);
 
 static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 {
 	char * const buf = str; /* for logging only */
-	const char *p;
+	char *p;
 	const char * const endp = str + size;
 	struct ratelimit_ent *ent;	/* new entry */
 	struct ratelimit_ent *ent_chk;	/* old entry */
-	__be32 addr;
 	int ent_size;
 	int add;
 	int i;
-	int ptok = 0;
 	int warn = 1;
 
 	/* make sure that size is enough for two decrements */
@@ -378,21 +377,18 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 	--size;
 
 	/* determine address set size */
-	ent_size = 0;
+	ent_size = 1;
 	for (p = str;
-	    p < endp && *p && (ptok = in4_pton(p, size - (p - str), (u8 *)&addr, -1, &p));
-	    ++p) {
-		++ent_size;
-		if (p >= endp || !*p || *p == ' ')
-			break;
-		else if (*p != ',') {
-			pr_err("IP addresses should be separated with ',' (cmd: %s)\n", buf);
+		 p < endp && *p && *p!=' ';
+		 ++p) {
+		if (*p >= '0' && *p <= '9')
+			continue;
+		else if (*p == ',')
+			ent_size++;
+		else {
+			pr_err("Incorrect interface index list(cmd: %s)\n",buf);
 			return -EINVAL;
 		}
-	}
-	if (!ptok || (p < endp && *p && *p != ' ') || !ent_size) {
-		pr_err("Invalid IP address list (cmd: %s)\n", buf);
-		return -EINVAL;
 	}
 
 	/* prepare ent */
@@ -401,27 +397,26 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 		return -ENOMEM;
 
 	spin_lock_init(&ent->lock_bh);
-	for (i = 0, p = str;
-	    p < endp && *p && in4_pton(p, size - (p - str), (u8 *)&addr, -1, &p);
-	    ++p, ++i) {
-		struct ratelimit_match *mt = &ent->matches[i];
-		int j;
 
-		BUG_ON(i >= ent_size);
-		mt->addr = addr;
+	p = str;
+	for (i=0; i < ent_size; i++) {
+		struct ratelimit_match *mt = &ent->matches[i];
+		int ifindex;
+		int j;
+		ifindex = simple_strtoul(p,&p, 10);
+		p++;
+		BUG_ON(ifindex == 0);
 		mt->ent = ent;
+		mt->ifindex = ifindex;
 		++ent->mtcnt;
-		/* there should not be duplications,
-		 * this is also important for below test of mtcnt */
 		for (j = 0; j < i; ++j)
-			if (ent->matches[j].addr == addr) {
-				pr_err("Duplicated IP address %pI4 in list (cmd: %s)\n", &addr, buf);
+			if (ent->matches[j].ifindex == ifindex) {
+				pr_err("Duplicated ifindex %i in list (cmd: %s)\n", ifindex, buf);
 				kvfree(ent);
 				return -EINVAL;
 			}
-		if (p >= endp || !*p || *p == ' ')
-			break;
 	}
+
 	BUG_ON(ent->mtcnt != ent_size);
 
 	/* parse parameters */
@@ -447,7 +442,7 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 		}
 		val = simple_strtoul(v, NULL, 10);
 		switch (i) {
-            case 0:
+			case 0:
 				if (!(ht->mode & XT_RATELIMIT_PPS)) {
 					ent->car.cir = val / (HZ * BITS_PER_BYTE);
 					/* autoconfigure optimal parameters */
@@ -478,13 +473,13 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 		struct ratelimit_match *mt = &ent->matches[i];
 		struct ratelimit_ent *tent;
 
-		tent = ratelimit_match_find(ht, mt->addr);
+		tent = ratelimit_match_find(ht, mt->ifindex);
 		if (!ent_chk)
 			ent_chk = tent;
 		if (tent != ent_chk) {
 			/* no operation should reference multiple entries */
 			pr_err("IP address %pI4 from multiple rules (cmd: %s)\n",
-			    &mt->addr,  buf);
+				&mt->ifindex,  buf);
 			goto unlock_einval;
 		}
 	}
@@ -539,7 +534,7 @@ static char proc_buf[4000];
 
 static ssize_t
 ratelimit_proc_write(struct file *file, const char __user *input,
-    size_t size, loff_t *loff)
+	size_t size, loff_t *loff)
 {
 	struct xt_ratelimit_htable *ht = PDE_DATA(file_inode(file));
 	char *p;
@@ -591,9 +586,9 @@ static const struct file_operations ratelimit_fops = {
 static int htable_create(struct net *net, struct xt_ratelimit_mtinfo *minfo)
 	/* rule insertion chain, under ratelimit_mutex */
 {
-        struct ratelimit_net *ratelimit_net = ratelimit_pernet(net);
-        struct xt_ratelimit_htable *ht;
-        unsigned int hsize = hashsize; /* (entities) */
+		struct ratelimit_net *ratelimit_net = ratelimit_pernet(net);
+		struct xt_ratelimit_htable *ht;
+		unsigned int hsize = hashsize; /* (entities) */
 	unsigned int sz; /* (bytes) */
 	int i;
 
@@ -619,7 +614,7 @@ static int htable_create(struct net *net, struct xt_ratelimit_mtinfo *minfo)
 	strcpy(ht->name, minfo->name);
 	spin_lock_init(&ht->lock);
 	ht->pde = proc_create_data(minfo->name, 0644, ratelimit_net->ipt_ratelimit,
-		    &ratelimit_fops, ht);
+			&ratelimit_fops, ht);
 	if (ht->pde == NULL) {
 		kvfree(ht);
 		return -ENOMEM;
@@ -633,17 +628,17 @@ static int htable_create(struct net *net, struct xt_ratelimit_mtinfo *minfo)
 }
 
 static inline u_int32_t
-hash_addr(const struct xt_ratelimit_htable *ht, const __be32 addr)
+hash_addr(const struct xt_ratelimit_htable *ht, const int ifindex)
 {
-	return reciprocal_scale(jhash_1word(addr, 0), ht->size);
+	return reciprocal_scale(jhash_1word(ifindex, 0), ht->size);
 }
 
 /* get (car) entity by address */
 static inline struct ratelimit_ent *
 ratelimit_match_find(const struct xt_ratelimit_htable *ht,
-    const __be32 addr)
+	const int ifindex)
 {
-	const u_int32_t hash = hash_addr(ht, addr);
+	const u_int32_t hash = hash_addr(ht, ifindex);
 
 	if (!hlist_empty(&ht->hash[hash])) {
 		struct ratelimit_match *mt;
@@ -652,7 +647,7 @@ ratelimit_match_find(const struct xt_ratelimit_htable *ht,
 #endif
 
 		compat_hlist_for_each_entry_rcu(mt, pos, &ht->hash[hash], node)
-			if (mt->addr == addr)
+			if (mt->ifindex == ifindex)
 				return mt->ent;
 	}
 	return NULL;
@@ -685,7 +680,7 @@ static void ratelimit_ent_free_rcu(struct rcu_head *head)
  * so, should only be used on ent destrution, and never iterate over
  * live ent->mtcnt */
 static void ratelimit_match_free(struct xt_ratelimit_htable *ht,
-    struct ratelimit_match *mt)
+	struct ratelimit_match *mt)
 	/* htable_cleanup, under ratelimit_mutex */
 	/* under ht->lock */
 {
@@ -730,7 +725,7 @@ static void htable_cleanup(struct xt_ratelimit_htable *ht)
 
 /* remove ratelimit entry, called from proc interface */
 static void ratelimit_ent_del(struct xt_ratelimit_htable *ht,
-    struct ratelimit_ent *ent)
+	struct ratelimit_ent *ent)
 	/* under ht->lock */
 {
 	int i;
@@ -749,7 +744,7 @@ static void ratelimit_table_flush(struct xt_ratelimit_htable *ht)
 
 /* register entry into hash table */
 static void ratelimit_ent_add(struct xt_ratelimit_htable *ht,
-    struct ratelimit_ent *ent)
+	struct ratelimit_ent *ent)
 	/* under ht->lock */
 {
 	int i;
@@ -758,7 +753,7 @@ static void ratelimit_ent_add(struct xt_ratelimit_htable *ht,
 	for (i = 0; i < ent->mtcnt; i++) {
 		struct ratelimit_match *mt = &ent->matches[i];
 
-		hlist_add_head_rcu(&mt->node, &ht->hash[hash_addr(ht, mt->addr)]);
+		hlist_add_head_rcu(&mt->node, &ht->hash[hash_addr(ht, mt->ifindex)]);
 		ht->mt_count++;
 	}
 	ht->ent_count++;
@@ -784,7 +779,7 @@ static void htable_destroy(struct xt_ratelimit_htable *ht)
 
 /* allocate htable caused by match rule insertion with iptables */
 static int htable_get(struct net *net,
-    struct xt_ratelimit_mtinfo *minfo)
+	struct xt_ratelimit_mtinfo *minfo)
 	/* iptables rule addition chain */
 	/* under ratelimit_mutex */
 {
@@ -844,16 +839,19 @@ ratelimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	struct xt_ratelimit_htable *ht = mtinfo->ht;
 	struct ratelimit_ent *ent;
 	const unsigned long now = jiffies;
-	__be32 addr;
+	int ifindex;
 	int match = false; /* no match, no drop */
 
 	if (mtinfo->mode & XT_RATELIMIT_DST)
-		addr = ip_hdr(skb)->daddr;
+		if(likely(par->out))
+			ifindex = par->out->ifindex;
+		else
+			return match;
 	else
-		addr = ip_hdr(skb)->saddr;
+		ifindex = par->in->ifindex;
 
 	rcu_read_lock();
-	ent = ratelimit_match_find(ht, addr);
+	ent = ratelimit_match_find(ht, ifindex);
 	if (ent) {
 		struct ratelimit_car *car = &ent->car;
 		const unsigned int len = skb->len; /* L3 */
@@ -932,7 +930,7 @@ static void ratelimit_mt_destroy(const struct xt_mtdtor_param *par)
 static struct xt_match ratelimit_mt_reg[] __read_mostly = {
 	{
 		.name		= "ratelimit",
-		.family		= NFPROTO_IPV4,
+        .family		= NFPROTO_UNSPEC,
 		.match		= ratelimit_mt,
 		.matchsize	= sizeof(struct xt_ratelimit_mtinfo),
 		.checkentry	= ratelimit_mt_check,
@@ -945,13 +943,13 @@ static struct xt_match ratelimit_mt_reg[] __read_mostly = {
 /* net creation/destruction callbacks */
 static int __net_init ratelimit_net_init(struct net *net)
 {
-        struct ratelimit_net *ratelimit_net = ratelimit_pernet(net);
+		struct ratelimit_net *ratelimit_net = ratelimit_pernet(net);
 
-        INIT_HLIST_HEAD(&ratelimit_net->htables);
+		INIT_HLIST_HEAD(&ratelimit_net->htables);
 	ratelimit_net->ipt_ratelimit = proc_mkdir("ipt_ratelimit", net->proc_net);
 	if (!ratelimit_net->ipt_ratelimit)
 		return -ENOMEM;
-        return 0;
+	return 0;
 }
 
 /* unregister all htables from this net */
@@ -973,31 +971,31 @@ static void __net_exit ratelimit_net_exit(struct net *net)
 }
 
 static struct pernet_operations ratelimit_net_ops = {
-        .init   = ratelimit_net_init,
-        .exit   = ratelimit_net_exit,
-        .id     = &ratelimit_net_id,
-        .size   = sizeof(struct ratelimit_net),
+		.init   = ratelimit_net_init,
+		.exit   = ratelimit_net_exit,
+		.id     = &ratelimit_net_id,
+		.size   = sizeof(struct ratelimit_net),
 };
 
 static int __init ratelimit_mt_init(void)
 {
-        int err;
+		int err;
 
-        err = register_pernet_subsys(&ratelimit_net_ops);
-        if (err)
-                return err;
-        err = xt_register_matches(ratelimit_mt_reg, ARRAY_SIZE(ratelimit_mt_reg));
-        if (err)
-                unregister_pernet_subsys(&ratelimit_net_ops);
+		err = register_pernet_subsys(&ratelimit_net_ops);
+		if (err)
+				return err;
+		err = xt_register_matches(ratelimit_mt_reg, ARRAY_SIZE(ratelimit_mt_reg));
+		if (err)
+				unregister_pernet_subsys(&ratelimit_net_ops);
 	pr_info(XT_RATELIMIT_VERSION " load %s.\n", err? "error" : "success");
-        return err;
+		return err;
 }
 
 static void __exit ratelimit_mt_exit(void)
 {
 	pr_info("unload.\n");
-        xt_unregister_matches(ratelimit_mt_reg, ARRAY_SIZE(ratelimit_mt_reg));
-        unregister_pernet_subsys(&ratelimit_net_ops);
+		xt_unregister_matches(ratelimit_mt_reg, ARRAY_SIZE(ratelimit_mt_reg));
+		unregister_pernet_subsys(&ratelimit_net_ops);
 }
 
 module_init(ratelimit_mt_init);
