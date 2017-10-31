@@ -181,9 +181,10 @@ unsigned long calc_rate_est(const struct ratelimit_stat *stat)
 #define SAFEDIV(x,y) ((y)? ({ u64 __tmp = x; do_div(__tmp, y); (unsigned int)__tmp; }) : 0)
 
 static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
-	struct seq_file *s, __u32 mode)
+    struct seq_file *s, __u32 mode, struct net *net)
 {
 	struct ratelimit_ent *ent = mt->ent;
+    struct net_device *dev;
 	int i;
 
 	/* to print entities only once, we print only entities
@@ -194,9 +195,17 @@ static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
 	/* lock for consistent reads from the counters */
 	spin_lock_bh(&ent->lock_bh);
 	for (i = 0; i < ent->mtcnt; i++) {
-		seq_printf(s, "%s%i",
-			i == 0? "" : ",",
-			ent->matches[i].ifindex);
+        dev = dev_get_by_index(net, ent->matches[i].ifindex);
+        if (dev) {
+            seq_printf(s, "%s%s",
+                i == 0? "" : ",",
+                dev->name);
+            dev_put(dev);
+        } else {
+            seq_printf(s, "%sNotExist_%i",
+                i == 0? "" : ",",
+                ent->matches[i].ifindex);
+        }
 	}
 	if (mode & XT_RATELIMIT_PPS) {
 		seq_printf(s, " cir %u cbs %u ebs %u;",
@@ -241,7 +250,7 @@ static int ratelimit_seq_show(struct seq_file *s, void *v)
 	/* print everything from the bucket at once */
 	if (!hlist_empty(&ht->hash[*bucket])) {
 		compat_hlist_for_each_entry(mt, pos, &ht->hash[*bucket], node)
-			if (ratelimit_seq_ent_show(mt, s, ht->mode))
+            if (ratelimit_seq_ent_show(mt, s, ht->mode, ht->net))
 				return -1;
 	}
 	return 0;
